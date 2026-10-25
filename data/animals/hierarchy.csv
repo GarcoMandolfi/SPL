@@ -1,0 +1,19 @@
+constraint_type,args,description
+implication,"IsVertebrate,IsAnimal",IsVertebrate → IsAnimal
+implication,"IsInvertebrate,IsAnimal",IsInvertebrate → IsAnimal
+implication,"IsBird,IsVertebrate",IsBird → IsVertebrate
+implication,"IsFish,IsVertebrate",IsFish → IsVertebrate
+implication,"IsAmphibian,IsVertebrate",IsAmphibian → IsVertebrate
+implication,"IsReptile,IsVertebrate",IsReptile → IsVertebrate
+implication,"IsInsect,IsInvertebrate",IsInsect → IsInvertebrate
+implication,"HasFeathers,IsBird",HasFeathers → IsBird
+implication,"IsFlightless,IsBird",IsFlightless → IsBird
+implication,"HasFins,IsFish",HasFins → IsFish
+implication,"IsFreshwater,IsFish",IsFreshwater → IsFish
+implication,"HasExoskeleton,IsInsect",HasExoskeleton → IsInsect
+implication,"IsFish,IsAquatic",IsFish → IsAquatic
+implication,"IsAmphibian,IsAquatic",IsAmphibian → IsAquatic
+mutex,"IsVertebrate,IsInvertebrate",Exactly one: vertebrate xor invertebrate
+mutex,"IsBird,IsFish,IsAmphibian,IsReptile",Exactly one vertebrate subclass (when IsVertebrate=1)
+mutex,"CanFly,IsFlightless",Cannot both fly and be flightless
+mutex,"HasFins,HasLegs",Has fins xor has legs (in this dataset)

@@ -1,0 +1,9 @@
+class,IsAnimal,IsVertebrate,IsInvertebrate,IsBird,IsFish,IsAmphibian,IsReptile,IsInsect,HasFeathers,HasFins,HasExoskeleton,HasLegs,CanFly,IsFlightless,IsFreshwater,IsAquatic
+Eagle,1,1,0,1,0,0,0,0,1,0,0,1,1,0,0,0
+Ostrich,1,1,0,1,0,0,0,0,1,0,0,1,0,1,0,0
+Salmon,1,1,0,0,1,0,0,0,0,1,0,0,0,0,1,1
+Tuna,1,1,0,0,1,0,0,0,0,1,0,0,0,0,0,1
+Frog,1,1,0,0,0,1,0,0,0,0,0,1,0,0,0,1
+Butterfly,1,0,1,0,0,0,0,1,0,0,1,1,1,0,0,0
+Ant,1,0,1,0,0,0,0,1,0,0,1,1,0,0,0,0
+Lizard,1,1,0,0,0,0,1,0,0,0,0,1,0,0,0,0
