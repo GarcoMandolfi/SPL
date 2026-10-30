@@ -90,6 +90,7 @@ class DCBM(pl.LightningModule):
         if self.pretrain_freeze:
             for param in self.model_backbone.parameters():
                 param.requires_grad = False
+            self.model_backbone.eval()
 
         assert hasattr(self.model_backbone, "repr")
         if type(model_backbone) == WideResNet:
@@ -132,6 +133,12 @@ class DCBM(pl.LightningModule):
         self.err_c_y_val = []
         self.err_rate_task_val = []
         self.setup_optimizer = setup_optimizer
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.pretrain_freeze:
+            self.model_backbone.eval()
+        return self
     
     def repr(self, x_batch: torch.Tensor):
         return self.model_backbone.repr(x_batch)
@@ -143,7 +150,7 @@ class DCBM(pl.LightningModule):
                 lr = self.learning_rate,
                 weight_decay = 4e-5,
             )
-            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=25, gamma=0.5, verbose=True)
+            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=25, gamma=0.5)
             return {
                 "optimizer": optimizer,
                 "lr_scheduler": {
@@ -161,7 +168,6 @@ class DCBM(pl.LightningModule):
             )
             scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 optimizer,
-                verbose=True,
                 patience=10,
                 factor=0.1,
                 min_lr=getattr(self, 'min_lr', 1e-5),
@@ -179,7 +185,7 @@ class DCBM(pl.LightningModule):
                 lr = self.learning_rate,
                 weight_decay = 4e-5,
             )
-            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=25, gamma=0.5, verbose=True)
+            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=25, gamma=0.5)
             return {
                 "optimizer": optimizer,
                 "lr_scheduler": {
@@ -318,29 +324,23 @@ class DCBM(pl.LightningModule):
                     + torch.mean(l_3 * w_vec * lambdas))
 
         elif active_loss == "ASM":
-            # shift so the largest logit is 0 -> every exp() lands in (0, 1]
-            y_logit = y_logit - torch.max(y_logit, dim=-1).values.unsqueeze(-1)
+            logit_ml = y_logit[:, :, :self.indicator]
+            logit_expert = y_logit[:, :, self.indicator:]
 
-            nll_ml = -torch.nn.functional.log_softmax(y_logit[:, :, :self.indicator], dim=-1)
+            nll_ml = -torch.nn.functional.log_softmax(logit_ml, dim=-1)
             nll_ml_gt = torch.gather(nll_ml, -1, y_batch)
 
-            exp_all = torch.exp(y_logit)
-            exp_ml = exp_all[:, :, :self.indicator]
-            exp_expert = exp_all[:, :, self.indicator:]
-
-            s_ml = torch.sum(exp_ml, dim=-1).unsqueeze(-1)
-            m_ml = torch.max(exp_ml, dim=-1).values.unsqueeze(-1)
-
-            num = s_ml - m_ml                                                    # runner-up mass
-            den = torch.sum(exp_all, dim=-1).unsqueeze(-1) - m_ml + self.eps
-            log_p_predict = torch.log(num / den + self.eps)                      # log P(not defer)
+            top = torch.argmax(logit_ml, dim=-1, keepdim=True)
+            log_num = torch.logsumexp(logit_ml.scatter(-1, top, float("-inf")), dim=-1, keepdim=True)
+            log_den = torch.logaddexp(log_num, logit_expert)
+            log_p_predict = log_num - log_den        # log P(not defer)
+            log_p_defer = logit_expert - log_den    # log P(defer)
 
             l_1 = nll_ml_gt - log_p_predict
 
             if self.label_smoothing_free:
                 l_2 = self.deferral_cost * mask_wrong.to(torch.float32) * torch.min(
-                    nll_ml - torch.log(torch.clamp(1 - exp_expert / den, min=self.eps)),
-                    dim=-1,
+                    nll_ml - log_p_predict, dim=-1,
                 ).values.unsqueeze(-1)
             else:
                 l_2 = self.deferral_cost * mask_wrong.to(torch.float32) * (
@@ -348,8 +348,7 @@ class DCBM(pl.LightningModule):
                 )
 
             l_3 = (1 - self.deferral_cost) * mask_right.to(torch.float32) * (
-                -torch.log(torch.clamp(exp_expert / den, min=self.eps))
-                + torch.log(torch.clamp(num / den, min=self.eps))
+                -log_p_defer + log_p_predict
             )
 
             loss = (torch.mean(l_1 * w_vec * lambdas)

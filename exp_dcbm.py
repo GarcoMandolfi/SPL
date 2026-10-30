@@ -1,5 +1,5 @@
 """
-Train a DCBM (see DCBM.py) on CUB-200-2011.
+Run the DCBM deferral-cost sweep (see DCBM.py)
 """
 import argparse
 import os
@@ -11,6 +11,7 @@ import torchvision.models
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from torchvision.models.resnet import BasicBlock
+from pytorch_lightning.callbacks import ModelCheckpoint
 import pandas as pd
 
 from scc.data.animals.animals_loader import generate_data
@@ -20,7 +21,6 @@ from DCBM import DCBM
 
 # torch configurations
 torch.set_float32_matmul_precision("medium")
-torch.autograd.set_detect_anomaly(True)
 
 COST_GRID = [0.0, 0.01, 0.02, 0.0225, 0.025, 0.0275, 0.03, 0.04,
              0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]
@@ -85,7 +85,7 @@ def main(
     lr: float = 1e-3,
     folds: int = 3,
     psi_loss: str = "ASM",
-    num_workers: int = 16,
+    num_workers: int = 0,
     seed: int = 42,
     network: str = "resnet34",
     cuda_device: int = 0,
@@ -99,6 +99,8 @@ def main(
     expert_task_acc: float = 1.0,
 ):
 
+    run_id = time.strftime("%Y%m%d-%H%M%S")
+
     # Set device using Pytorch Lightning
     pl.seed_everything(seed)
     concept_human = False if expert_concept == "human" else True
@@ -111,20 +113,21 @@ def main(
     str_name = "Rn34"
 
     results = pd.DataFrame()
+    os.makedirs(res_dir, exist_ok=True)
     for fold in range(folds):
-        pl.seed_everything(fold + 42)
+        pl.seed_everything(fold + seed)
         print(f"Fold {fold + 1}/{folds}")
 
         # Resample the split per fold so error bars reflect sampling variance,
         # not just weight initialisation. Everything downstream of the split
         # (class counts, concept imbalance) is therefore fold-local.
         train_loader, val_loader, test_loader, imbalance = generate_data(
-            root_dir="data/", config=data_config, seed=None,
+            root_dir="data/", config=data_config, seed=fold + seed,
         )
         n_classes = train_loader.dataset.n_classes
         n_concepts = train_loader.dataset.n_concepts
 
-        # Disable concept weighting
+        # Per-concept class weights: 1 for negatives, neg/pos ratio for positives
         if imbalance is None:
             weight_concepts = None
         else:
@@ -132,31 +135,28 @@ def main(
                 [torch.ones((len(imbalance), 1)).float(),
                  torch.tensor(imbalance).unsqueeze(-1).float()], dim=1).unsqueeze(0)
             print(weight_concepts.shape)
-        if baseline_cbm == "cbm":
-            models = {
-                "DCBM{}-PT_{}-independent".format(str_name, pretrained_dataset):
-                    dict(embedding_size=embedding_size,
-                         n_classes=n_classes,
-                         n_concepts=n_concepts,
-                         n_experts=1,
-                         n_tasks=1,
-                         learning_rate=lr,
-                         psi_loss="CE-nohuman",
-                         psi_loss_tasks="CE-nohuman",
-                         psi_loss_concepts="CE-nohuman",
-                         weights_concepts=weight_concepts,
-                         concept_lambdas=[5 for _ in range(n_concepts)],
-                         label_smoothing=True,
-                         training_mode="independent",
-                         pretrain_freeze=False,
-                         )}
-        else:
-            models = {}
-        if psi_loss not in ["CE", "ASM", "OVA"]:
-            raise ValueError(f"Unknown psi_loss: {psi_loss}")
 
         label_sm = True
         tm = "independent"
+
+        models = {}
+        if baseline_cbm == "cbm":
+            models["CBM-PT_{}-{}-LS_{}".format(pretrained_dataset, tm, label_sm)] = _dcbm_kwargs(
+                embedding_size=embedding_size,
+                lr=lr,
+                cost=0.0,
+                psi_loss="CE-nohuman",
+                psi_loss_tasks="CE-nohuman",
+                psi_loss_concepts="CE-nohuman",
+                weight_concepts=weight_concepts,
+                n_classes=n_classes,
+                n_concepts=n_concepts,
+                label_sm=label_sm,
+                tm=tm,
+            )
+        if psi_loss not in ["CE", "ASM", "OVA"]:
+            raise ValueError(f"Unknown psi_loss: {psi_loss}")
+
         variants = [
             ("",                   psi_loss,      psi_loss),
             ("-NoHumanFinal",      "CE-nohuman",  psi_loss),
@@ -192,6 +192,10 @@ def main(
             # train and log the model
             logger = TensorBoardLogger("tb_logs", name=model_name)
             use_cuda = torch.cuda.is_available()
+
+            checkpoint = ModelCheckpoint(monitor="loss_val", mode="min",
+                                         save_top_k=1, save_weights_only=True)
+
             trainer = pl.Trainer(
                 max_epochs=n_epochs,
                 accelerator="gpu" if use_cuda else "cpu",
@@ -200,6 +204,7 @@ def main(
                 check_val_every_n_epoch=1,
                 gradient_clip_val=5,
                 deterministic=True,
+                log_every_n_steps=1,
                 callbacks=[
                     EarlyStopping(
                         monitor="loss_val",
@@ -207,26 +212,35 @@ def main(
                         mode="min",
                         verbose=False,
                         min_delta=0.0,
-                    )]
+                    ),
+                    checkpoint,]
             )
             # compute training time
             start = time.time()
-            path_model = "models/cub/check{}__{}_{}__CE_default_f{}_ES__{}.pt".format(
-                model_name, network, model_expert_task, 42 + fold, embedding_size)
-            if weight_concepts is not None:
-                path_model = "{}.pt".format(path_model.replace(".pt", "_Weighted.pt"))
-            if pretrained_task == "x2y":
-                path_model = path_model.replace("CE_default", "CE_default__x2y")
+            model_dir = os.path.join("models", "animals")
+            os.makedirs(model_dir, exist_ok=True)
+            path_model = os.path.join(
+                model_dir,
+                "{}__eC{}_eT{}_f{}_emb{}{}.pt".format(
+                    model_name, expert_concept_acc, expert_task_acc, seed + fold, embedding_size,
+                    "_Weighted" if weight_concepts is not None else "",
+                ),
+            )
             print(path_model)
             trainer.fit(model, train_loader, val_loader)
-            os.makedirs("models/cub", exist_ok=True)
             train_time = time.time() - start
+
+            best = torch.load(checkpoint.best_model_path, map_location="cpu", weights_only=False)
+            model.load_state_dict(best["state_dict"])
+            os.remove(checkpoint.best_model_path)
+
             model.training_time = train_time
             torch.save(model.state_dict(), path_model)
             print(f"Training time: {train_time:.2f}")
             model.eval()
-            print("Model loaded")
-            tmp = test_model(testloader=test_loader, model=model, seed=fold + seed, path_results="resultsDCBM.csv")
+            print(f"Best model loaded (epoch {best['epoch']})")
+            tmp = test_model(testloader=test_loader, model=model, seed=fold + seed,
+                             path_results=os.path.join(res_dir, f"resultsDCBM_{run_id}.csv"))
             tmp["full_name"] = model_name
             tmp["n_concepts"] = n_concepts
             tmp["n_experts"] = n_experts
@@ -234,14 +248,15 @@ def main(
             tmp["n_samples"] = test_loader.dataset.__len__()
             tmp["n_epochs"] = n_epochs
             tmp["train_time"] = train_time
+            tmp["fold"] = fold
+            tmp["expert_concept_acc"] = expert_concept_acc
+            tmp["expert_task_acc"] = expert_task_acc
+            tmp["run_id"] = run_id
             results = pd.concat([results, tmp], axis=0)
             print("\n \n \n \n \n\n\n\n Accuracy task is {}".format(tmp["acc_test_task"].values[0]))
-            os.makedirs(res_dir, exist_ok=True)
-            res_path = res_dir + "/NEURIPS2025_ALLresults{}wWeights_{}-humanTask{}_{}_DCBM.csv".format(
-                pretrained_dataset,
-                psi_loss,
-                model_expert_task,
-                network,
+            res_path = os.path.join(
+                res_dir,
+                f"DCBM_{pretrained_dataset}_{psi_loss}_eC{expert_concept_acc}_eT{expert_task_acc}.csv",
             )
             if weight_concepts is not None:
                 res_path = res_path.replace(".csv", "_Weighted.csv")
@@ -253,7 +268,6 @@ def main(
 
 
 if __name__ == "__main__":
-    torch.autograd.set_detect_anomaly(True)
     parser = argparse.ArgumentParser()
     parser.add_argument("--psi_loss", type=str, default="ASM")
     parser.add_argument("--seed", type=int, default=42)
@@ -267,9 +281,9 @@ if __name__ == "__main__":
     parser.add_argument("--network", type=str, default="resnet34")
     parser.add_argument("--pretrained_task", type=str, default="x2y")
     # Expert competence. 1.0 = oracle, which leaves the l_2 term of the DCBM
-    # loss identically zero; the paper's settings are 0.8 and 0.6.
-    parser.add_argument("--expert_concept_acc", type=float, default=1.0)
-    parser.add_argument("--expert_task_acc", type=float, default=1.0)
+    parser.add_argument("--expert_concept_acc", type=float, default=0.8)
+    parser.add_argument("--expert_task_acc", type=float, default=0.8)
+    parser.add_argument("--num_workers", type=int, default=0)
     args = parser.parse_args()
 
     main(
@@ -284,4 +298,5 @@ if __name__ == "__main__":
         expert_concept=args.expert_concept,
         expert_concept_acc=args.expert_concept_acc,
         expert_task_acc=args.expert_task_acc,
+        num_workers=args.num_workers
     )
